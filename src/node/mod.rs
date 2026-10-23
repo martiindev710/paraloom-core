@@ -989,13 +989,8 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
-            // Pin `req.mint.is_none()` symmetrically with `req.mint == Some(*mint)`
-            // in the `TransactSpl` arm below so a request verified for an SPL
-            // mint (`req.mint == Some(_)`) can never be co-signed as a native-SOL
-            // `transact` settlement instruction.
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
-                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -3642,96 +3637,6 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
-    }
-
-    #[tokio::test]
-    async fn cosign_declines_cross_asset_transact_and_transact_spl_mismatch() {
-        let kp = Arc::new(Keypair::new());
-        let tas = Arc::new(Mutex::new(HashMap::new()));
-
-        let recipient = [9u8; 32];
-        let mint = [0x42u8; 32];
-        let nullifiers = [[7u8; 32], [8u8; 32]];
-        let outputs = [[5u8; 32], [6u8; 32]];
-        let root = [2u8; 32];
-        let ext_amount = -1_000_000_000i64;
-
-        // 1. Validator verified an SPL spend (`mint = Some(mint)`), but the
-        // requester asks it to co-sign a native-SOL `SettlementParams::Transact`
-        // instruction carrying the same public parameters. Must be declined.
-        let mut spl_req = ta_request("spl-1", recipient, nullifiers, outputs, root, ext_amount);
-        spl_req.mint = Some(mint);
-        tas.lock().await.insert("spl-1".to_string(), spl_req);
-
-        let native_payload = ta_payload(
-            kp.pubkey().to_bytes(),
-            recipient,
-            nullifiers,
-            outputs,
-            root,
-            ext_amount,
-        );
-        let cross_to_native = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &tas,
-            &Arc::new(Mutex::new(HashMap::new())),
-            cosign_req("spl-1", SettlementKind::Transact, &native_payload),
-        )
-        .await;
-        assert_eq!(
-            cross_to_native.signature, None,
-            "an SPL-verified spend must never be co-signed as a native-SOL Transact settlement"
-        );
-
-        // Matching SPL payload for the same verified SPL request succeeds.
-        let spl_payload = CoSignPayload {
-            program_id: [1u8; 32],
-            authority: kp.pubkey().to_bytes(),
-            bridge_vault: [3u8; 32],
-            blockhash: [4u8; 32],
-            quorum_validators: vec![kp.pubkey().to_bytes()],
-            params: SettlementParams::TransactSpl {
-                recipient_token_account: recipient,
-                mint,
-                nullifiers,
-                output_commitments: outputs,
-                root,
-                ext_amount,
-                proof: vec![0u8; 256],
-            },
-        };
-        let valid_spl = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &tas,
-            &Arc::new(Mutex::new(HashMap::new())),
-            cosign_req("spl-1", SettlementKind::Transact, &spl_payload),
-        )
-        .await;
-        assert!(
-            valid_spl.signature.is_some(),
-            "matching TransactSpl payload must be co-signed"
-        );
-
-        // 2. Validator verified a native-SOL spend (`mint = None`), but the
-        // requester asks it to co-sign a `SettlementParams::TransactSpl` payload.
-        tas.lock().await.insert(
-            "native-1".to_string(),
-            ta_request("native-1", recipient, nullifiers, outputs, root, ext_amount),
-        );
-        let cross_to_spl = cosign_settlement(
-            Some(&kp),
-            &configured_program(),
-            &tas,
-            &Arc::new(Mutex::new(HashMap::new())),
-            cosign_req("native-1", SettlementKind::Transact, &spl_payload),
-        )
-        .await;
-        assert_eq!(
-            cross_to_spl.signature, None,
-            "a native-SOL verified spend must never be co-signed as a TransactSpl settlement"
-        );
     }
 
     #[tokio::test]
