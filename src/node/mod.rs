@@ -989,8 +989,13 @@ async fn cosign_settlement(
             },
         ) => {
             let cache = verified_transacts.lock().await;
+            // Pin `req.mint.is_none()` symmetrically with `req.mint == Some(*mint)`
+            // in the `TransactSpl` arm below so a request verified for an SPL
+            // mint (`req.mint == Some(_)`) can never be co-signed as a native-SOL
+            // `transact` settlement instruction.
             let approved = cache.get(&request.request_id).is_some_and(|req| {
                 req.recipient == *recipient
+                    && req.mint.is_none()
                     && req.nullifiers == *nullifiers
                     && req.output_commitments == *output_commitments
                     && req.root == *root
@@ -2329,8 +2334,11 @@ impl Node {
     }
 
     /// Record the encrypted output notes of a transfer for recipient scanning
-    /// (#196), de-duplicated by `(commitment, ciphertext)` so the same transfer
-    /// seen via both ingress and gossip is stored once.
+    /// (#196), de-duplicated by `output_commitment` so the same output note
+    /// cannot be recorded multiple times with mutated ciphertexts (e.g. via a
+    /// re-randomized Groth16 proof with a fresh `request_id` or after the
+    /// bounded `verified_transacts` cache evicts an older `request_id`) to
+    /// FIFO-evict authentic notes from the 50,000-entry scan buffer.
     async fn record_delivered_notes(
         &self,
         output_commitments: &[[u8; 32]; 2],
@@ -2358,9 +2366,10 @@ impl Node {
                 ciphertext: ciphertext.clone(),
                 mint: mint.clone(),
             };
-            if store.iter().any(|d| {
-                d.output_commitment == note.output_commitment && d.ciphertext == note.ciphertext
-            }) {
+            if store
+                .iter()
+                .any(|d| d.output_commitment == note.output_commitment)
+            {
                 continue;
             }
             // Evict the oldest note when at capacity (FIFO).
@@ -3633,5 +3642,114 @@ mod tests {
         assert!(node.shielded_pool.is_none());
         assert!(node.bridge.is_none());
         assert!(node.transact_coordinator.is_none());
+    }
+
+    #[tokio::test]
+    async fn cosign_declines_cross_asset_transact_and_transact_spl_mismatch() {
+        let kp = Arc::new(Keypair::new());
+        let tas = Arc::new(Mutex::new(HashMap::new()));
+
+        let recipient = [9u8; 32];
+        let mint = [0x42u8; 32];
+        let nullifiers = [[7u8; 32], [8u8; 32]];
+        let outputs = [[5u8; 32], [6u8; 32]];
+        let root = [2u8; 32];
+        let ext_amount = -1_000_000_000i64;
+
+        // 1. Validator verified an SPL spend (`mint = Some(mint)`), but the
+        // requester asks it to co-sign a native-SOL `SettlementParams::Transact`
+        // instruction carrying the same public parameters. Must be declined.
+        let mut spl_req = ta_request("spl-1", recipient, nullifiers, outputs, root, ext_amount);
+        spl_req.mint = Some(mint);
+        tas.lock().await.insert("spl-1".to_string(), spl_req);
+
+        let native_payload = ta_payload(
+            kp.pubkey().to_bytes(),
+            recipient,
+            nullifiers,
+            outputs,
+            root,
+            ext_amount,
+        );
+        let cross_to_native = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("spl-1", SettlementKind::Transact, &native_payload),
+        )
+        .await;
+        assert_eq!(
+            cross_to_native.signature, None,
+            "an SPL-verified spend must never be co-signed as a native-SOL Transact settlement"
+        );
+
+        // Matching SPL payload for the same verified SPL request succeeds.
+        let spl_payload = CoSignPayload {
+            program_id: [1u8; 32],
+            authority: kp.pubkey().to_bytes(),
+            bridge_vault: [3u8; 32],
+            blockhash: [4u8; 32],
+            quorum_validators: vec![kp.pubkey().to_bytes()],
+            params: SettlementParams::TransactSpl {
+                recipient_token_account: recipient,
+                mint,
+                nullifiers,
+                output_commitments: outputs,
+                root,
+                ext_amount,
+                proof: vec![0u8; 256],
+            },
+        };
+        let valid_spl = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("spl-1", SettlementKind::Transact, &spl_payload),
+        )
+        .await;
+        assert!(
+            valid_spl.signature.is_some(),
+            "matching TransactSpl payload must be co-signed"
+        );
+
+        // 2. Validator verified a native-SOL spend (`mint = None`), but the
+        // requester asks it to co-sign a `SettlementParams::TransactSpl` payload.
+        tas.lock().await.insert(
+            "native-1".to_string(),
+            ta_request("native-1", recipient, nullifiers, outputs, root, ext_amount),
+        );
+        let cross_to_spl = cosign_settlement(
+            Some(&kp),
+            &configured_program(),
+            &tas,
+            &Arc::new(Mutex::new(HashMap::new())),
+            cosign_req("native-1", SettlementKind::Transact, &spl_payload),
+        )
+        .await;
+        assert_eq!(
+            cross_to_spl.signature, None,
+            "a native-SOL verified spend must never be co-signed as a TransactSpl settlement"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_delivered_notes_deduplicates_by_output_commitment_across_mutated_ciphertexts() {
+        let node = Node::new(Settings::development()).expect("construct node");
+        let commitments = [[0x11u8; 32], [0x22u8; 32]];
+
+        node.record_delivered_notes(&commitments, &["aa".repeat(88), "bb".repeat(88)], None)
+            .await;
+        // Re-recording the same output commitments with mutated ciphertexts
+        // (e.g. via a re-randomized Groth16 proof with a distinct request_id)
+        // must not append duplicate entries or overwrite the original ciphertexts.
+        node.record_delivered_notes(&commitments, &["cc".repeat(88), "dd".repeat(88)], None)
+            .await;
+
+        let delivered = node.delivered_notes().await;
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].ciphertext, "aa".repeat(88));
+        assert_eq!(delivered[1].ciphertext, "bb".repeat(88));
     }
 }
