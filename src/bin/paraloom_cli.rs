@@ -114,12 +114,39 @@ enum Commands {
     },
 }
 
+const CLI_LAMPORTS_PER_SOL: f64 = 1_000_000_000.0;
+
+fn parse_positive_sol_amount(raw: &str) -> std::result::Result<f64, String> {
+    let amount: f64 = raw
+        .parse()
+        .map_err(|e| format!("invalid SOL amount '{raw}': {e}"))?;
+    if !amount.is_finite() || amount <= 0.0 {
+        return Err("amount must be a finite number greater than 0".to_string());
+    }
+    let lamports = (amount * CLI_LAMPORTS_PER_SOL).round();
+    if !lamports.is_finite() || lamports < 1.0 || lamports > (u64::MAX as f64) {
+        return Err(
+            "amount out of valid lamport range (must be >= 0.000000001 SOL and fit in u64 lamports)"
+                .to_string(),
+        );
+    }
+    Ok(amount)
+}
+
+fn parse_non_empty_recipient(raw: &str) -> std::result::Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("recipient address must not be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 #[derive(Subcommand)]
 enum WalletCommands {
     /// Deposit SOL to Paraloom privacy pool
     Deposit {
         /// Amount in SOL
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_positive_sol_amount)]
         amount: f64,
 
         /// Solana RPC URL (default: devnet)
@@ -138,11 +165,16 @@ enum WalletCommands {
     /// Transfer SOL privately within Paraloom
     Transfer {
         /// Recipient shielded address
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            visible_alias = "recipient-address",
+            value_parser = parse_non_empty_recipient
+        )]
         to: String,
 
         /// Amount in SOL
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_positive_sol_amount)]
         amount: f64,
 
         /// Optional memo (encrypted)
@@ -153,11 +185,16 @@ enum WalletCommands {
     /// Withdraw SOL from Paraloom to Solana
     Withdraw {
         /// Destination Solana address
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            visible_alias = "recipient-address",
+            value_parser = parse_non_empty_recipient
+        )]
         to: String,
 
         /// Amount in SOL
-        #[arg(short, long)]
+        #[arg(short, long, value_parser = parse_positive_sol_amount)]
         amount: f64,
 
         /// Solana RPC URL (default: devnet)
@@ -503,8 +540,11 @@ async fn handle_wallet_command(command: WalletCommands) -> Result<()> {
                     balance as f64 / LAMPORTS_PER_SOL as f64
                 );
 
-                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64) as u64;
-                if balance < deposit_lamports + LAMPORTS_PER_SOL / 100 {
+                let deposit_lamports = (amount * LAMPORTS_PER_SOL as f64).round() as u64;
+                let required_lamports = deposit_lamports
+                    .checked_add(LAMPORTS_PER_SOL / 100)
+                    .context("Deposit amount overflows u64 lamports with fee reserve")?;
+                if balance < required_lamports {
                     anyhow::bail!(
                         "Insufficient balance. Need at least {} SOL (+ 0.01 SOL for fees)",
                         amount
@@ -2178,4 +2218,144 @@ file = ".paraloom/logs/paraloom.log"
     println!("  4. Start validator (optional): paraloom validator start --config paraloom.toml");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deposit_rejects_zero_and_negative_amounts_at_parse_time() {
+        let zero = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "0"]);
+        assert!(zero.is_err(), "--amount 0 must be rejected");
+
+        let zero_float = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "0.0"]);
+        assert!(zero_float.is_err(), "--amount 0.0 must be rejected");
+
+        let neg = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount=-1.5"]);
+        assert!(neg.is_err(), "negative --amount must be rejected");
+
+        let sub_lamport =
+            Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "0.0000000001"]);
+        assert!(sub_lamport.is_err(), "sub-lamport --amount must be rejected");
+
+        let nan = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "NaN"]);
+        assert!(nan.is_err(), "NaN --amount must be rejected");
+
+        let inf = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "inf"]);
+        assert!(inf.is_err(), "inf --amount must be rejected");
+    }
+
+    #[test]
+    fn withdraw_rejects_zero_amount_and_empty_recipient_address_at_parse_time() {
+        let zero = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "withdraw",
+            "--amount",
+            "0",
+            "--to",
+            "11111111111111111111111111111111",
+        ]);
+        assert!(zero.is_err(), "withdraw --amount 0 must be rejected");
+
+        let empty_to = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "withdraw",
+            "--amount",
+            "1.0",
+            "--to",
+            "",
+        ]);
+        assert!(empty_to.is_err(), "withdraw --to empty string must be rejected");
+
+        let empty_recipient_alias = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "withdraw",
+            "--amount",
+            "1.0",
+            "--recipient-address",
+            "",
+        ]);
+        assert!(
+            empty_recipient_alias.is_err(),
+            "withdraw --recipient-address empty string must be rejected"
+        );
+
+        let whitespace_recipient = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "withdraw",
+            "--amount",
+            "1.0",
+            "--recipient-address",
+            "   ",
+        ]);
+        assert!(
+            whitespace_recipient.is_err(),
+            "withdraw whitespace --recipient-address must be rejected"
+        );
+    }
+
+    #[test]
+    fn transfer_rejects_zero_amount_and_empty_recipient_at_parse_time() {
+        let zero = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "transfer",
+            "--amount",
+            "0",
+            "--to",
+            "paraloom10000000000000000000000000000000000000000000000000000000000000000",
+        ]);
+        assert!(zero.is_err(), "transfer --amount 0 must be rejected");
+
+        let empty_to = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "transfer",
+            "--amount",
+            "1.0",
+            "--recipient-address",
+            "",
+        ]);
+        assert!(
+            empty_to.is_err(),
+            "transfer --recipient-address empty string must be rejected"
+        );
+    }
+
+    #[test]
+    fn deposit_and_withdraw_accept_valid_arguments() {
+        let deposit = Cli::try_parse_from(["paraloom", "wallet", "deposit", "--amount", "1.5"])
+            .expect("valid deposit args should parse");
+        match deposit.command {
+            Commands::Wallet {
+                command: WalletCommands::Deposit { amount, .. },
+            } => assert!((amount - 1.5).abs() < f64::EPSILON),
+            _ => panic!("expected WalletCommands::Deposit"),
+        }
+
+        let withdraw = Cli::try_parse_from([
+            "paraloom",
+            "wallet",
+            "withdraw",
+            "--amount",
+            "0.25",
+            "--recipient-address",
+            "11111111111111111111111111111111",
+        ])
+        .expect("valid withdraw args should parse");
+        match withdraw.command {
+            Commands::Wallet {
+                command: WalletCommands::Withdraw { to, amount, .. },
+            } => {
+                assert_eq!(to, "11111111111111111111111111111111");
+                assert!((amount - 0.25).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected WalletCommands::Withdraw"),
+        }
+    }
 }
